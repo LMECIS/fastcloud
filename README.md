@@ -11,11 +11,7 @@ Telegram-уведомления и мониторинг. Полностью бе
 
 На чистом сервере Ubuntu/Debian под root:
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/LMECIS/FastCloud/main/install.sh | sudo bash
-```
-
-Или скачайте и запустите вручную:
+Cкачайте и запустите:
 
 ```bash
 git clone https://github.com/LMECIS/FastCloud.git
