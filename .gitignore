@@ -1,0 +1,15 @@
+# Локальные артефакты установки (генерируются в /opt/fastcloud, но на всякий случай)
+.env
+.telegram_config
+.rclone.conf
+.monitor_config
+.monitor_state
+.backup_remote
+.admin_password
+.install_mode
+
+# Резервные копии
+*.bak
+
+# Системное
+.DS_Store
