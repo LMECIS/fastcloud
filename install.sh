@@ -1288,24 +1288,60 @@ nc_installed() {
     docker compose exec -T nextcloud curl -fsS http://localhost/status.php 2>/dev/null \
         | grep -q '"installed":true'
 }
-MAX_WAIT=300
-for i in $(seq 1 $MAX_WAIT); do
-    if nc_installed; then
-        progress_bar $MAX_WAIT $MAX_WAIT
-        ok "Nextcloud инициализирован"
-        break
-    fi
-    progress_bar $i $MAX_WAIT
-    sleep 1
-done
 
-if ! nc_installed; then
+wait_for_install() {
+    local max_wait=$1
+    for i in $(seq 1 "$max_wait"); do
+        if nc_installed; then
+            progress_bar "$max_wait" "$max_wait"
+            return 0
+        fi
+        progress_bar "$i" "$max_wait"
+        sleep 1
+    done
+    return 1
+}
+
+MAX_WAIT=300
+if wait_for_install "$MAX_WAIT"; then
+    ok "Nextcloud инициализирован"
+else
     echo ""
-    warn "Nextcloud не завершил установку за ${MAX_WAIT} с. Диагностика:"
-    docker compose exec -T nextcloud curl -fsS http://localhost/status.php 2>/dev/null || true
-    echo ""
-    docker compose logs --tail 30 nextcloud 2>/dev/null || true
-    error "Nextcloud не удалось инициализировать за отведенное время"
+    warn "Nextcloud не завершил установку за ${MAX_WAIT} с. Проверяю причину..."
+
+    # Классическая проблема: config.php остался от прерванной установки
+    # (например, из-за OOM), и entrypoint больше не пытается установить заново.
+    if docker compose exec -T nextcloud test -f /var/www/html/config/config.php 2>/dev/null; then
+        warn "Найден config.php от предыдущей попытки установки."
+        warn "Похоже, установка была прервана (нехватка RAM?) и не была завершена."
+        info "Пересоздаю установку: удаляю недописанный config.php и схему БД, повторяю попытку..."
+
+        docker compose exec -T nextcloud rm -f /var/www/html/config/config.php || true
+        docker compose exec -T db psql -U nextcloud -d nextcloud \
+            -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" > /dev/null 2>&1 || true
+        docker compose restart nextcloud
+
+        info "Повторное ожидание инициализации (ещё до ${MAX_WAIT} с)..."
+        if wait_for_install "$MAX_WAIT"; then
+            ok "Nextcloud инициализирован со второй попытки"
+        else
+            echo ""
+            warn "Повторная попытка тоже не удалась. Диагностика:"
+            docker compose exec -T nextcloud curl -fsS http://localhost/status.php 2>/dev/null || true
+            echo ""
+            docker compose logs --tail 50 nextcloud 2>/dev/null | grep -iv '"GET \|"HEAD \|"POST ' || true
+            echo ""
+            docker compose logs --tail 30 db 2>/dev/null || true
+            error "Nextcloud не удалось инициализировать. Проверьте объём RAM и логи БД."
+        fi
+    else
+        echo ""
+        warn "config.php отсутствует — установка не запустилась вовсе. Диагностика:"
+        docker compose logs --tail 50 nextcloud 2>/dev/null | grep -iv '"GET \|"HEAD \|"POST ' || true
+        echo ""
+        docker compose logs --tail 30 db 2>/dev/null || true
+        error "Nextcloud не удалось инициализировать за отведенное время"
+    fi
 fi
 
 header "Оптимизация Nextcloud"
