@@ -1279,9 +1279,15 @@ run_with_spinner "Запуск Caddy..." docker compose up -d caddy
 ok "Все контейнеры запущены"
 
 echo -e "${BLUE}[INFO]${NC} Ожидание инициализации Nextcloud..."
-MAX_WAIT=150
+# ВАЖНО: `occ status` возвращает 0 и до завершения установки (печатая
+# installed: false), поэтому ждём именно "installed: true" — иначе шаги
+# db:* ниже упадут с "Nextcloud is not installed".
+nc_installed() {
+    docker compose exec -T nextcloud php occ status 2>/dev/null | grep -q 'installed: true'
+}
+MAX_WAIT=300
 for i in $(seq 1 $MAX_WAIT); do
-    if docker compose exec -T nextcloud php occ status &>/dev/null; then
+    if nc_installed; then
         progress_bar $MAX_WAIT $MAX_WAIT
         ok "Nextcloud инициализирован"
         break
@@ -1290,7 +1296,10 @@ for i in $(seq 1 $MAX_WAIT); do
     sleep 1
 done
 
-if ! docker compose exec -T nextcloud php occ status &>/dev/null; then
+if ! nc_installed; then
+    echo ""
+    warn "Nextcloud не завершил установку за ${MAX_WAIT} с. Последние логи контейнера:"
+    docker compose logs --tail 30 nextcloud 2>/dev/null || true
     error "Nextcloud не удалось инициализировать за отведенное время"
 fi
 
