@@ -36,6 +36,37 @@ jobs:
           # SC1090 — динамический source конфигов, ожидаемо и безопасно.
           shellcheck --severity=warning --exclude=SC1090 /tmp/gen/*.sh
 
+      # `tr < /dev/urandom | head -c N` роняет скрипт с кодом 141: head рвёт
+      # пайп, tr получает SIGPIPE, `set -euo pipefail` завершает установку
+      # молча. Один раз это уже сломало установщик — держим проверку в CI.
+      - name: Guard against SIGPIPE in random generation
+        run: |
+          # Опасен только бесконечный поток, обрываемый head: сначала
+          # отбрасываем строки-комментарии, затем ищем urandom, после которого
+          # в том же пайпе стоит head. Безопасная форма `head -c N /dev/urandom`
+          # (head идёт ДО urandom и завершается сам) не срабатывает.
+          if grep -vE '^[[:space:]]*#' install.sh \
+              | grep -nE '/dev/urandom.*\|.*head'; then
+            echo "::error::небезопасный пайп urandom→head (SIGPIPE, exit 141)"
+            exit 1
+          fi
+          echo "небезопасных пайпов не найдено"
+
+      - name: Smoke-test password generation
+        run: |
+          # Функция должна работать именно под set -euo pipefail.
+          eval "$(awk '/^gen_password\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' install.sh)"
+          set -euo pipefail
+          for n in 24 32 48; do
+            pw=$(gen_password "$n")
+            test "${#pw}" -eq "$n" \
+              || { echo "::error::gen_password $n вернул ${#pw} символов"; exit 1; }
+            case "$pw" in
+              *[^A-Za-z0-9]*) echo "::error::в пароле есть спецсимволы"; exit 1 ;;
+            esac
+          done
+          echo "gen_password корректна для 24/32/48"
+
   compose:
     runs-on: ubuntu-latest
     steps:

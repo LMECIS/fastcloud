@@ -66,9 +66,17 @@ is_valid_email() {
 
 # Пароль ровно заданной длины из алфавита без спецсимволов: значения попадают
 # в .env, docker-compose и psql, где кавычки/слэши ломают парсинг.
+#
+# ВАЖНО: нельзя писать `tr < /dev/urandom | head -c N` — head закрывает пайп
+# после N байт, tr получает SIGPIPE, и под `set -euo pipefail` весь скрипт
+# молча падает с кодом 141. Поэтому читаем фиксированный блок заранее
+# (head завершается сам), а длину подрезаем через cut, который дочитывает
+# весь ввод и пайп не рвёт.
 gen_password() {
-    local len=${1:-32}
-    LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "$len"
+    local len=${1:-32} pw
+    pw=$(head -c 4096 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9' | cut -c1-"$len")
+    [[ ${#pw} -eq $len ]] || return 1
+    printf '%s' "$pw"
 }
 
 run_with_spinner() {
@@ -607,6 +615,16 @@ ok()    { echo -e "${GREEN}[OK]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
+# Пароль заданной длины без спецсимволов. Читаем блок заранее и режем через
+# cut: вариант `tr < /dev/urandom | head -c N` роняет скрипт с кодом 141
+# (SIGPIPE у tr) при включённом `set -euo pipefail`.
+gen_password() {
+    local len=${1:-32} pw
+    pw=$(head -c 4096 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9' | cut -c1-"$len")
+    [[ ${#pw} -eq $len ]] || return 1
+    printf '%s' "$pw"
+}
+
 cmd_status() {
     info "Статус FastCloud:"
     echo ""
@@ -780,7 +798,7 @@ cmd_verify_backup() {
     # PostgreSQL. Контейнер временный и не касается рабочей базы.
     local probe="fastcloud-verify-$$"
     local probe_pw
-    probe_pw=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)
+    probe_pw=$(gen_password 24)
     local pg_image
     pg_image=$(grep -oE 'image:[[:space:]]*postgres:[^[:space:]]+' "${INSTALL_DIR}/docker-compose.yml" \
         | head -n1 | awk '{print $2}')
@@ -1253,7 +1271,7 @@ cmd_reset_password() {
         echo ""
     fi
     if [[ -z "$new_password" ]]; then
-        new_password=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)
+        new_password=$(gen_password 24)
         info "Сгенерирован новый пароль."
     fi
 
