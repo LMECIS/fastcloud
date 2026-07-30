@@ -52,6 +52,16 @@ jobs:
           fi
           echo "небезопасных пайпов не найдено"
 
+      # occ под root создаёт файлы в data/ с владельцем root, после чего Apache
+      # (www-data) их не читает. Все вызовы обязаны идти через -u www-data.
+      - name: Guard against running occ as root
+        run: |
+          if grep -n 'exec -T nextcloud php occ' install.sh; then
+            echo "::error::occ вызывается без -u www-data (файлы станут root-owned)"
+            exit 1
+          fi
+          echo "все occ-вызовы идут через www-data"
+
       - name: Smoke-test password generation
         run: |
           # Функция должна работать именно под set -euo pipefail.

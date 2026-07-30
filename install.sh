@@ -707,19 +707,19 @@ cmd_backup() {
     BACKUP_FILE="${BACKUP_DIR}/fastcloud_backup_${TIMESTAMP}.tar.gz"
     local tmp_file="${BACKUP_FILE}.partial"
 
-    docker compose exec -T nextcloud php occ maintenance:mode --on > /dev/null 2>&1 || true
+    docker compose exec -T -u www-data nextcloud php occ maintenance:mode --on > /dev/null 2>&1 || true
 
     # Согласованный дамп БД через pg_dump вместо копирования "горячего" каталога db/.
     local staging
     staging=$(mktemp -d)
     info "Дамп базы данных (pg_dump)..."
     if ! docker compose exec -T db pg_dump -U nextcloud nextcloud | gzip > "${staging}/database.sql.gz"; then
-        docker compose exec -T nextcloud php occ maintenance:mode --off > /dev/null 2>&1 || true
+        docker compose exec -T -u www-data nextcloud php occ maintenance:mode --off > /dev/null 2>&1 || true
         rm -rf "$staging"
         error "Не удалось создать дамп базы данных."
     fi
     [[ -s "${staging}/database.sql.gz" ]] || {
-        docker compose exec -T nextcloud php occ maintenance:mode --off > /dev/null 2>&1 || true
+        docker compose exec -T -u www-data nextcloud php occ maintenance:mode --off > /dev/null 2>&1 || true
         rm -rf "$staging"
         error "Дамп базы данных пуст — бэкап не создан."
     }
@@ -727,7 +727,7 @@ cmd_backup() {
     # Версию Nextcloud пишем в архив: restore на несовместимый мажор ломает
     # приложение уже после импорта БД, когда откатываться поздно.
     local nc_version
-    nc_version=$(docker compose exec -T nextcloud php occ status --output=json 2>/dev/null \
+    nc_version=$(docker compose exec -T -u www-data nextcloud php occ status --output=json 2>/dev/null \
         | tr -d ' ' | grep -oE '"versionstring":"[^"]+"' | cut -d'"' -f4 || true)
     cat > "${staging}/backup_meta" <<META
 FASTCLOUD_BACKUP_VERSION=1
@@ -735,16 +735,27 @@ NEXTCLOUD_VERSION=${nc_version:-unknown}
 CREATED_AT=$(date -Iseconds)
 META
 
+    # Настройки Telegram/rclone/мониторинга и режим установки тоже кладём в
+    # архив: без них восстановленная система теряет уведомления и оффсайт-
+    # бэкапы, а doctor/monitor не понимают режим. Файлы опциональные, поэтому
+    # собираем список из существующих.
+    local extra=()
+    for f in .install_mode .admin_password .telegram_config .monitor_config \
+             .rclone.conf .backup_remote; do
+        [[ -f "${INSTALL_DIR}/${f}" ]] && extra+=("$f")
+    done
+
     info "Архивирование данных и конфигурации..."
     if ! tar -czf "$tmp_file" \
         -C "$INSTALL_DIR" data Caddyfile nextcloud.ini .env docker-compose.yml \
+        "${extra[@]}" \
         -C "$staging" database.sql.gz backup_meta; then
-        docker compose exec -T nextcloud php occ maintenance:mode --off > /dev/null 2>&1 || true
+        docker compose exec -T -u www-data nextcloud php occ maintenance:mode --off > /dev/null 2>&1 || true
         rm -f "$tmp_file"; rm -rf "$staging"
         error "Не удалось создать архив (проверьте свободное место)."
     fi
 
-    docker compose exec -T nextcloud php occ maintenance:mode --off > /dev/null 2>&1 || true
+    docker compose exec -T -u www-data nextcloud php occ maintenance:mode --off > /dev/null 2>&1 || true
     rm -rf "$staging"
 
     # Архив считается готовым только после успешной проверки целостности,
@@ -801,7 +812,7 @@ cmd_verify_backup() {
     probe_pw=$(gen_password 24)
     local pg_image
     pg_image=$(grep -oE 'image:[[:space:]]*postgres:[^[:space:]]+' "${INSTALL_DIR}/docker-compose.yml" \
-        | head -n1 | awk '{print $2}')
+        | head -n1 | awk '{print $2}' || true)
     pg_image=${pg_image:-postgres:15-alpine}
 
     docker run -d --rm --name "$probe" \
@@ -861,7 +872,7 @@ cmd_restore() {
         local backup_nc_ver current_nc_ver
         backup_nc_ver=$(tar -xzf "$backup_file" -O backup_meta 2>/dev/null \
             | grep '^NEXTCLOUD_VERSION=' | cut -d= -f2- || true)
-        current_nc_ver=$(docker compose exec -T nextcloud php occ status --output=json 2>/dev/null \
+        current_nc_ver=$(docker compose exec -T -u www-data nextcloud php occ status --output=json 2>/dev/null \
             | tr -d ' ' | grep -oE '"versionstring":"[^"]+"' | cut -d'"' -f4 || true)
         if [[ -n "$backup_nc_ver" && "$backup_nc_ver" != "unknown" && -n "$current_nc_ver" ]]; then
             if [[ "${backup_nc_ver%%.*}" != "${current_nc_ver%%.*}" ]]; then
@@ -934,6 +945,15 @@ cmd_restore() {
     for f in Caddyfile nextcloud.ini .env docker-compose.yml; do
         [[ -f "${staging}/${f}" ]] && cp -a "${staging}/${f}" "${INSTALL_DIR}/${f}"
     done
+    # Опциональные файлы (Telegram, rclone, мониторинг) есть только в архивах,
+    # снятых после их настройки — восстанавливаем те, что нашлись.
+    for f in .install_mode .admin_password .telegram_config .monitor_config \
+             .rclone.conf .backup_remote; do
+        if [[ -f "${staging}/${f}" ]]; then
+            cp -a "${staging}/${f}" "${INSTALL_DIR}/${f}"
+            chmod 600 "${INSTALL_DIR}/${f}"
+        fi
+    done
 
     info "Запуск базы данных..."
     docker compose up -d db || rollback_restore
@@ -990,20 +1010,24 @@ cmd_update() {
     info "Создание бэкапа перед обновлением..."
     cmd_backup
 
-    # Запоминаем текущие digest'ы: теги плавающие, и при неудачном обновлении
-    # без них вернуться к работавшим образам невозможно.
-    local prev_digests
-    prev_digests=$(docker compose config --images 2>/dev/null | while read -r img; do
+    # Фиксируем ID работающих сейчас образов. Теги плавающие: после `pull` тот
+    # же тег указывает на новый образ, и без записанных ID вернуться к
+    # работавшей версии невозможно (см. подсказку про откат ниже).
+    local prev_images
+    prev_images=$(docker compose config --images 2>/dev/null | while read -r img; do
         [[ -n "$img" ]] || continue
-        docker image inspect "$img" --format '{{.RepoTags}} {{.Id}}' 2>/dev/null || true
+        printf '%s %s\n' "$img" "$(docker image inspect "$img" --format '{{.Id}}' 2>/dev/null || echo unknown)"
     done)
-    [[ -n "$prev_digests" ]] && printf '%s\n' "$prev_digests" > "${INSTALL_DIR}/.previous_images"
+    if [[ -n "$prev_images" ]]; then
+        printf '%s\n' "$prev_images" > "${INSTALL_DIR}/.previous_images"
+        chmod 600 "${INSTALL_DIR}/.previous_images"
+    fi
 
-    docker compose exec -T nextcloud php occ maintenance:mode --on > /dev/null 2>&1 || true
+    docker compose exec -T -u www-data nextcloud php occ maintenance:mode --on > /dev/null 2>&1 || true
 
     info "Скачивание новых образов..."
     if ! docker compose pull; then
-        docker compose exec -T nextcloud php occ maintenance:mode --off > /dev/null 2>&1 || true
+        docker compose exec -T -u www-data nextcloud php occ maintenance:mode --off > /dev/null 2>&1 || true
         error "Не удалось скачать образы. Обновление отменено, стек не тронут."
     fi
 
@@ -1029,18 +1053,25 @@ cmd_update() {
         docker compose logs --tail 30 nextcloud 2>/dev/null | grep -iv '"GET \|"HEAD \|"POST ' || true
         echo ""
         warn "Доступен бэкап, созданный перед обновлением, в ${BACKUP_DIR}."
-        echo -e "  Откат: ${CYAN}./manage.sh restore <файл-бэкапа>${NC}"
-        docker compose exec -T nextcloud php occ maintenance:mode --off > /dev/null 2>&1 || true
+        echo -e "  Откат данных: ${CYAN}./manage.sh restore <файл-бэкапа>${NC}"
+        if [[ -s "${INSTALL_DIR}/.previous_images" ]]; then
+            echo ""
+            info "Образы, работавшие до обновления (для откате версии вручную):"
+            sed 's/^/    /' "${INSTALL_DIR}/.previous_images"
+            echo -e "  Закрепить прежнюю версию: подставьте нужный тег/ID в"
+            echo -e "  ${CYAN}docker-compose.yml${NC}, затем ${CYAN}./manage.sh restart${NC}"
+        fi
+        docker compose exec -T -u www-data nextcloud php occ maintenance:mode --off > /dev/null 2>&1 || true
         error "Обновление завершилось неудачно."
     fi
     ok "Nextcloud отвечает после обновления"
 
-    docker compose exec -T nextcloud php occ maintenance:mode --off > /dev/null 2>&1 || true
+    docker compose exec -T -u www-data nextcloud php occ maintenance:mode --off > /dev/null 2>&1 || true
 
     info "Применение оптимизаций..."
-    docker compose exec -T nextcloud php occ db:add-missing-indices --no-interaction > /dev/null 2>&1 || true
-    docker compose exec -T nextcloud php occ db:add-missing-columns --no-interaction > /dev/null 2>&1 || true
-    docker compose exec -T nextcloud php occ maintenance:repair --no-interaction > /dev/null 2>&1 || true
+    docker compose exec -T -u www-data nextcloud php occ db:add-missing-indices --no-interaction > /dev/null 2>&1 || true
+    docker compose exec -T -u www-data nextcloud php occ db:add-missing-columns --no-interaction > /dev/null 2>&1 || true
+    docker compose exec -T -u www-data nextcloud php occ maintenance:repair --no-interaction > /dev/null 2>&1 || true
 
     info "Очистка устаревших Docker-образов..."
     docker image prune -f > /dev/null 2>&1 || true
@@ -1081,8 +1112,8 @@ cmd_doctor() {
 
     echo -e "${CYAN}Диск:${NC}"
     local use_pct free_h
-    use_pct=$(df --output=pcent "$INSTALL_DIR" 2>/dev/null | tail -n1 | tr -dc '0-9')
-    free_h=$(df -h "$INSTALL_DIR" | awk 'NR==2 {print $4}')
+    use_pct=$(df --output=pcent "$INSTALL_DIR" 2>/dev/null | tail -n1 | tr -dc '0-9' || true)
+    free_h=$(df -h "$INSTALL_DIR" 2>/dev/null | awk 'NR==2 {print $4}' || true)
     if [[ -n "$use_pct" && $use_pct -ge 90 ]]; then
         echo -e "  ${RED}✗${NC} занято ${use_pct}%, свободно ${free_h}"
         problems=$((problems + 1))
@@ -1098,8 +1129,8 @@ cmd_doctor() {
 
     echo -e "${CYAN}Память:${NC}"
     local mem_free_mb swap_used_mb
-    mem_free_mb=$(free -m | awk '/^Mem:/ {print $7}')
-    swap_used_mb=$(free -m | awk '/^Swap:/ {print $3}')
+    mem_free_mb=$(free -m 2>/dev/null | awk '/^Mem:/ {print $7}' || true)
+    swap_used_mb=$(free -m 2>/dev/null | awk '/^Swap:/ {print $3}' || true)
     if [[ -n "$mem_free_mb" && $mem_free_mb -lt 150 ]]; then
         echo -e "  ${YELLOW}!${NC} доступно ${mem_free_mb} МБ — риск OOM"
         warnings=$((warnings + 1))
@@ -1115,7 +1146,7 @@ cmd_doctor() {
     echo -e "${CYAN}SSL-сертификат:${NC}"
     local mode; mode=$(cat "${INSTALL_DIR}/.install_mode" 2>/dev/null || echo "")
     if [[ "$mode" == "public-domain" ]]; then
-        local dom; dom=$(grep '^DOMAIN=' "${INSTALL_DIR}/.env" 2>/dev/null | cut -d= -f2-)
+        local dom; dom=$(grep '^DOMAIN=' "${INSTALL_DIR}/.env" 2>/dev/null | cut -d= -f2- || true)
         local not_after days_left
         not_after=$(echo | openssl s_client -servername "$dom" -connect "${dom}:443" 2>/dev/null \
             | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2 || true)
@@ -1143,9 +1174,10 @@ cmd_doctor() {
     local latest
     latest=$(ls -t "${BACKUP_DIR}"/fastcloud_backup_*.tar.gz 2>/dev/null | head -n1 || true)
     if [[ -n "$latest" ]]; then
-        local age_days
-        age_days=$(( ( $(date +%s) - $(stat -c %Y "$latest") ) / 86400 ))
-        local count; count=$(ls "${BACKUP_DIR}"/fastcloud_backup_*.tar.gz 2>/dev/null | wc -l)
+        local age_days mtime
+        mtime=$(stat -c %Y "$latest" 2>/dev/null || echo 0)
+        age_days=$(( ( $(date +%s) - mtime ) / 86400 ))
+        local count; count=$(ls "${BACKUP_DIR}"/fastcloud_backup_*.tar.gz 2>/dev/null | wc -l || true)
         if [[ $age_days -gt 7 ]]; then
             echo -e "  ${RED}✗${NC} последний бэкап ${age_days} дн. назад ($(basename "$latest"))"
             problems=$((problems + 1))
@@ -1224,7 +1256,7 @@ cmd_doctor() {
     echo -e "${CYAN}Права на секреты:${NC}"
     for f in .env .admin_password .telegram_config .rclone.conf; do
         [[ -f "${INSTALL_DIR}/${f}" ]] || continue
-        local perms; perms=$(stat -c %a "${INSTALL_DIR}/${f}")
+        local perms; perms=$(stat -c %a "${INSTALL_DIR}/${f}" 2>/dev/null || echo "?")
         if [[ "$perms" == "600" ]]; then
             echo -e "  ${GREEN}✓${NC} ${f}: ${perms}"
         else
@@ -1249,8 +1281,11 @@ cmd_show_password() {
         info "Пароль администратора:"
         echo -e "  ${YELLOW}$(cat ${INSTALL_DIR}/.admin_password)${NC}"
     elif [[ -f "${INSTALL_DIR}/.env" ]]; then
+        local pw
+        pw=$(grep '^ADMIN_PASSWORD=' "${INSTALL_DIR}/.env" | cut -d= -f2- || true)
+        [[ -n "$pw" ]] || error "В .env нет строки ADMIN_PASSWORD."
         info "Пароль администратора (из .env):"
-        echo -e "  ${YELLOW}$(grep '^ADMIN_PASSWORD=' "${INSTALL_DIR}/.env" | cut -d= -f2-)${NC}"
+        echo -e "  ${YELLOW}${pw}${NC}"
     else
         error "Файл с паролем не найден"
     fi
@@ -1732,7 +1767,9 @@ fi
 # Истёкший сертификат — самая частая причина недоступности самохоста, причём
 # Caddy может молча не продлить его (занят порт 80, rate-limit LE).
 if [[ "$(cat "${INSTALL_DIR}/.install_mode" 2>/dev/null)" == "public-domain" ]]; then
-    DOM=$(grep '^DOMAIN=' "${INSTALL_DIR}/.env" 2>/dev/null | cut -d= -f2-)
+    # || true обязателен: grep без совпадения возвращает 1 и под set -e убил бы
+    # monitor.sh до отправки алертов — молча, ведь он работает из cron.
+    DOM=$(grep '^DOMAIN=' "${INSTALL_DIR}/.env" 2>/dev/null | cut -d= -f2- || true)
     if [[ -n "$DOM" ]]; then
         NOT_AFTER=$(echo | timeout 10 openssl s_client -servername "$DOM" -connect "${DOM}:443" 2>/dev/null \
             | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2 || true)
@@ -1751,7 +1788,8 @@ fi
 # последнего архива.
 LATEST_BACKUP=$(ls -t /opt/fastcloud-backups/fastcloud_backup_*.tar.gz 2>/dev/null | head -n1 || true)
 if [[ -n "$LATEST_BACKUP" ]]; then
-    BACKUP_AGE_DAYS=$(( ( $(date +%s) - $(stat -c %Y "$LATEST_BACKUP") ) / 86400 ))
+    BACKUP_MTIME=$(stat -c %Y "$LATEST_BACKUP" 2>/dev/null || echo 0)
+    BACKUP_AGE_DAYS=$(( ( $(date +%s) - BACKUP_MTIME ) / 86400 ))
     if [[ $BACKUP_AGE_DAYS -gt 8 ]]; then
         ALERTS+="💾 Последний бэкап создан ${BACKUP_AGE_DAYS} дн. назад"$'\n'
     fi
@@ -1881,7 +1919,10 @@ fi
 
 header "Оптимизация Nextcloud"
 
-OCC="docker compose exec -T nextcloud php occ"
+# -u www-data обязателен: под root occ создаёт файлы в data/ и config/ с
+# владельцем root, после чего Apache (www-data) не может их прочитать или
+# перезаписать. Тот же пользователь используется в cron и в `manage.sh occ`.
+OCC="docker compose exec -T -u www-data nextcloud php occ"
 
 run_with_spinner "Добавление отсутствующих индексов БД..." $OCC db:add-missing-indices --no-interaction
 run_with_spinner "Добавление отсутствующих колонок БД..." $OCC db:add-missing-columns --no-interaction
