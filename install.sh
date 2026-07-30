@@ -64,6 +64,13 @@ is_valid_email() {
     [[ "$1" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]
 }
 
+# Пароль ровно заданной длины из алфавита без спецсимволов: значения попадают
+# в .env, docker-compose и psql, где кавычки/слэши ломают парсинг.
+gen_password() {
+    local len=${1:-32}
+    LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "$len"
+}
+
 run_with_spinner() {
     local msg=$1
     shift
@@ -355,12 +362,33 @@ case "$MODE_CHOICE" in
         ;;
 esac
 
-DB_PASSWORD=$(openssl rand -base64 48 | tr -d '/+=' | head -c 24)
-REDIS_PASSWORD=$(openssl rand -base64 48 | tr -d '/+=' | head -c 24)
-ADMIN_PASSWORD=$(openssl rand -base64 48 | tr -d '/+=' | head -c 24)
+DB_PASSWORD=$(gen_password 32)
+REDIS_PASSWORD=$(gen_password 32)
+ADMIN_PASSWORD=$(gen_password 24)
+for _pw in "$DB_PASSWORD" "$REDIS_PASSWORD" "$ADMIN_PASSWORD"; do
+    [[ ${#_pw} -ge 24 ]] || error "Не удалось сгенерировать пароль нужной длины."
+done
 ok "Пароли сгенерированы автоматически"
 
 header "Генерация конфигурации"
+
+# Лимиты памяти считаем от фактического объёма RAM: без них OOM-killer на
+# слабом сервере убивает Postgres в момент записи, что грозит потерей данных.
+TOTAL_RAM_MB=$((TOTAL_RAM_KB / 1024))
+if [[ $TOTAL_RAM_MB -lt 2048 ]]; then
+    DB_MEM_LIMIT="384m";  REDIS_MEM_LIMIT="128m"; REDIS_MAXMEMORY="96mb"
+    NC_MEM_LIMIT="768m";  PHP_MEM="384M"
+elif [[ $TOTAL_RAM_MB -lt 4096 ]]; then
+    DB_MEM_LIMIT="512m";  REDIS_MEM_LIMIT="192m"; REDIS_MAXMEMORY="128mb"
+    NC_MEM_LIMIT="1g";    PHP_MEM="512M"
+elif [[ $TOTAL_RAM_MB -lt 8192 ]]; then
+    DB_MEM_LIMIT="1g";    REDIS_MEM_LIMIT="384m"; REDIS_MAXMEMORY="256mb"
+    NC_MEM_LIMIT="2g";    PHP_MEM="512M"
+else
+    DB_MEM_LIMIT="2g";    REDIS_MEM_LIMIT="512m"; REDIS_MAXMEMORY="384mb"
+    NC_MEM_LIMIT="4g";    PHP_MEM="768M"
+fi
+info "Лимиты памяти: db=${DB_MEM_LIMIT}, redis=${REDIS_MEM_LIMIT}, nextcloud=${NC_MEM_LIMIT}"
 
 mkdir -p "$INSTALL_DIR"/{data,db,redis,caddy_config,caddy_data,scripts}
 cd "$INSTALL_DIR"
@@ -376,9 +404,19 @@ OVERWRITE_HOST=${OVERWRITE_HOST}
 NC_URL=${NC_URL}
 INSTALL_DIR=${INSTALL_DIR}
 INSTALL_MODE=${INSTALL_MODE}
+DB_MEM_LIMIT=${DB_MEM_LIMIT}
+REDIS_MEM_LIMIT=${REDIS_MEM_LIMIT}
+REDIS_MAXMEMORY=${REDIS_MAXMEMORY}
+NC_MEM_LIMIT=${NC_MEM_LIMIT}
+PHP_MEM=${PHP_MEM}
 EOF
 chmod 600 .env
 ok "Создан .env (пароли сохранены)"
+
+# Режим фиксируем сразу: manage.sh doctor и monitor.sh опираются на него, и он
+# нужен даже если установка прервётся на следующих шагах.
+echo "${INSTALL_MODE}" > "${INSTALL_DIR}/.install_mode"
+chmod 600 "${INSTALL_DIR}/.install_mode"
 
 cat > docker-compose.yml <<'EOF'
 services:
@@ -396,13 +434,21 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    mem_limit: ${DB_MEM_LIMIT}
     networks:
       - nc_net
 
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: redis-server --requirepass ${REDIS_PASSWORD}
+    # maxmemory обязателен: Redis используется как кэш и без лимита растёт,
+    # пока не съест всю память сервера (на 2 ГБ VPS это OOM-kill Postgres).
+    command: >
+      redis-server --requirepass ${REDIS_PASSWORD}
+      --maxmemory ${REDIS_MAXMEMORY}
+      --maxmemory-policy allkeys-lru
+      --save ""
+      --appendonly no
     volumes:
       - ${INSTALL_DIR}/redis:/data
     healthcheck:
@@ -410,6 +456,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    mem_limit: ${REDIS_MEM_LIMIT}
     networks:
       - nc_net
 
@@ -440,7 +487,7 @@ services:
       # TRUSTED_PROXIES ожидает IP/CIDR: Caddy получает адрес из пула
       # default-address-pools (172.80.0.0/16), заданного в daemon.json.
       TRUSTED_PROXIES: 172.80.0.0/16
-      PHP_MEMORY_LIMIT: 512M
+      PHP_MEMORY_LIMIT: ${PHP_MEM}
       PHP_UPLOAD_LIMIT: 10G
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost/status.php || exit 1"]
@@ -448,6 +495,7 @@ services:
       timeout: 10s
       retries: 10
       start_period: 120s
+    mem_limit: ${NC_MEM_LIMIT}
     networks:
       - nc_net
 
@@ -518,10 +566,10 @@ EOF
     ok "Создан Caddyfile (режим: ${INSTALL_MODE}, SSL отключен)"
 fi
 
-cat > nextcloud.ini <<'EOF'
+cat > nextcloud.ini <<EOF
 upload_max_filesize = 10G
 post_max_size = 10G
-memory_limit = 512M
+memory_limit = ${PHP_MEM}
 max_execution_time = 3600
 max_input_time = 3600
 output_buffering = off
@@ -626,10 +674,20 @@ cmd_backup() {
 
     mkdir -p "$BACKUP_DIR"
 
+    cd "$INSTALL_DIR"
+
+    # Проверяем место ДО начала: на переполненном диске tar создаст битый архив,
+    # который затем вытеснит рабочий бэкап из ротации.
+    local need_kb free_kb
+    need_kb=$(du -sk "${INSTALL_DIR}/data" "${INSTALL_DIR}/db" 2>/dev/null | awk '{s+=$1} END {print int(s*0.6)+262144}')
+    free_kb=$(df -Pk "$BACKUP_DIR" | awk 'NR==2 {print $4}')
+    if [[ -n "$need_kb" && -n "$free_kb" && $free_kb -lt $need_kb ]]; then
+        error "Недостаточно места для бэкапа: нужно ~$((need_kb / 1024)) МБ, свободно $((free_kb / 1024)) МБ."
+    fi
+
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
     BACKUP_FILE="${BACKUP_DIR}/fastcloud_backup_${TIMESTAMP}.tar.gz"
-
-    cd "$INSTALL_DIR"
+    local tmp_file="${BACKUP_FILE}.partial"
 
     docker compose exec -T nextcloud php occ maintenance:mode --on > /dev/null 2>&1 || true
 
@@ -642,15 +700,44 @@ cmd_backup() {
         rm -rf "$staging"
         error "Не удалось создать дамп базы данных."
     fi
+    [[ -s "${staging}/database.sql.gz" ]] || {
+        docker compose exec -T nextcloud php occ maintenance:mode --off > /dev/null 2>&1 || true
+        rm -rf "$staging"
+        error "Дамп базы данных пуст — бэкап не создан."
+    }
+
+    # Версию Nextcloud пишем в архив: restore на несовместимый мажор ломает
+    # приложение уже после импорта БД, когда откатываться поздно.
+    local nc_version
+    nc_version=$(docker compose exec -T nextcloud php occ status --output=json 2>/dev/null \
+        | tr -d ' ' | grep -oE '"versionstring":"[^"]+"' | cut -d'"' -f4 || true)
+    cat > "${staging}/backup_meta" <<META
+FASTCLOUD_BACKUP_VERSION=1
+NEXTCLOUD_VERSION=${nc_version:-unknown}
+CREATED_AT=$(date -Iseconds)
+META
 
     info "Архивирование данных и конфигурации..."
-    tar -czf "$BACKUP_FILE" \
+    if ! tar -czf "$tmp_file" \
         -C "$INSTALL_DIR" data Caddyfile nextcloud.ini .env docker-compose.yml \
-        -C "$staging" database.sql.gz 2>/dev/null
+        -C "$staging" database.sql.gz backup_meta; then
+        docker compose exec -T nextcloud php occ maintenance:mode --off > /dev/null 2>&1 || true
+        rm -f "$tmp_file"; rm -rf "$staging"
+        error "Не удалось создать архив (проверьте свободное место)."
+    fi
 
     docker compose exec -T nextcloud php occ maintenance:mode --off > /dev/null 2>&1 || true
     rm -rf "$staging"
 
+    # Архив считается готовым только после успешной проверки целостности,
+    # поэтому до этого момента он лежит под именем *.partial.
+    info "Проверка целостности архива..."
+    if ! tar -tzf "$tmp_file" > /dev/null 2>&1; then
+        rm -f "$tmp_file"
+        error "Архив повреждён — бэкап не сохранён."
+    fi
+
+    mv "$tmp_file" "$BACKUP_FILE"
     chmod 600 "$BACKUP_FILE"   # содержит .env с паролями
     SIZE=$(du -h "$BACKUP_FILE" | cut -f1)
     ok "Бэкап создан: ${BACKUP_FILE} (${SIZE})"
@@ -659,80 +746,276 @@ cmd_backup() {
     prune_local_backups
 }
 
+cmd_verify_backup() {
+    local backup_file=${1:-}
+
+    if [[ -z "$backup_file" ]]; then
+        backup_file=$(ls -t "${BACKUP_DIR}"/fastcloud_backup_*.tar.gz 2>/dev/null | head -n1 || true)
+        [[ -n "$backup_file" ]] || error "Бэкапы не найдены в ${BACKUP_DIR}."
+        info "Проверяю последний бэкап: $(basename "$backup_file")"
+    fi
+    [[ -f "$backup_file" ]] || error "Файл бэкапа не найден: $backup_file"
+
+    info "1/3 Проверка целостности архива..."
+    tar -tzf "$backup_file" > /dev/null 2>&1 || error "Архив повреждён или не читается."
+    ok "Архив читается"
+
+    info "2/3 Проверка состава..."
+    local listing
+    listing=$(tar -tzf "$backup_file")
+    for required in "database.sql.gz" ".env" "docker-compose.yml"; do
+        grep -qx "$required" <<< "$listing" || error "В архиве отсутствует ${required}."
+    done
+    grep -q '^data/' <<< "$listing" || error "В архиве отсутствует каталог data/."
+    ok "Все обязательные компоненты на месте"
+
+    if grep -qx "backup_meta" <<< "$listing"; then
+        local meta
+        meta=$(tar -xzf "$backup_file" -O backup_meta 2>/dev/null || true)
+        [[ -n "$meta" ]] && echo "$meta" | sed 's/^/  /'
+    fi
+
+    info "3/3 Пробный импорт дампа БД в одноразовый контейнер..."
+    # Реальная проверка: дамп не просто распаковывается, а применяется к чистому
+    # PostgreSQL. Контейнер временный и не касается рабочей базы.
+    local probe="fastcloud-verify-$$"
+    local probe_pw
+    probe_pw=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)
+    local pg_image
+    pg_image=$(grep -oE 'image:[[:space:]]*postgres:[^[:space:]]+' "${INSTALL_DIR}/docker-compose.yml" \
+        | head -n1 | awk '{print $2}')
+    pg_image=${pg_image:-postgres:15-alpine}
+
+    docker run -d --rm --name "$probe" \
+        -e POSTGRES_DB=nextcloud -e POSTGRES_USER=nextcloud \
+        -e POSTGRES_PASSWORD="$probe_pw" "$pg_image" > /dev/null 2>&1 \
+        || error "Не удалось запустить временный контейнер PostgreSQL."
+
+    # EXIT, а не RETURN: error() завершает скрипт через exit, и RETURN-обработчик
+    # в этом случае не сработает — временный контейнер остался бы висеть.
+    trap 'docker rm -f "'"$probe"'" >/dev/null 2>&1 || true' EXIT
+
+    local ready=0
+    for _ in $(seq 1 40); do
+        if docker exec "$probe" pg_isready -U nextcloud > /dev/null 2>&1; then ready=1; break; fi
+        sleep 1
+    done
+    [[ $ready -eq 1 ]] || error "Временный PostgreSQL не поднялся."
+
+    if tar -xzf "$backup_file" -O database.sql.gz | gunzip \
+        | docker exec -i "$probe" psql -U nextcloud -d nextcloud -v ON_ERROR_STOP=1 > /dev/null 2>&1; then
+        local tables
+        tables=$(docker exec "$probe" psql -U nextcloud -d nextcloud -tAc \
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';" 2>/dev/null | tr -dc '0-9')
+        [[ "${tables:-0}" -gt 0 ]] || error "Дамп импортировался, но таблиц в схеме нет."
+        docker rm -f "$probe" > /dev/null 2>&1 || true
+        trap - EXIT
+        ok "Дамп БД успешно импортирован (таблиц: ${tables})"
+        echo ""
+        ok "Бэкап пригоден для восстановления: $(basename "$backup_file")"
+    else
+        error "Дамп БД не импортируется — этот бэкап восстановить не удастся!"
+    fi
+}
+
 cmd_restore() {
     local backup_file=${1:-}
 
     [[ -z "$backup_file" ]] && error "Укажите файл бэкапа: ./manage.sh restore <путь-к-архиву.tar.gz>"
     [[ ! -f "$backup_file" ]] && error "Файл бэкапа не найден: $backup_file"
 
-    warn "ВНИМАНИЕ: восстановление ПЕРЕЗАПИШЕТ текущие данные и базу FastCloud!"
-    read -rp "Продолжить восстановление из ${backup_file}? (введите 'yes'): " CONFIRM
-    [[ "$CONFIRM" != "yes" ]] && error "Восстановление отменено."
+    # Всё, что можно проверить, проверяем ДО остановки сервисов и до того,
+    # как тронуты рабочие данные.
+    info "Проверка архива перед восстановлением..."
+    tar -tzf "$backup_file" > /dev/null 2>&1 || error "Архив повреждён или не читается: ${backup_file}"
+
+    local listing
+    listing=$(tar -tzf "$backup_file")
+    grep -qx "database.sql.gz" <<< "$listing" || error "В архиве нет дампа БД (database.sql.gz)."
+    grep -q '^data/' <<< "$listing" || error "В архиве нет каталога data/."
+    ok "Архив корректен"
 
     cd "$INSTALL_DIR"
 
+    # Сверяем мажорную версию Nextcloud: импорт дампа от более старого мажора
+    # в новый образ проходит, но приложение после этого не работает.
+    if grep -qx "backup_meta" <<< "$listing"; then
+        local backup_nc_ver current_nc_ver
+        backup_nc_ver=$(tar -xzf "$backup_file" -O backup_meta 2>/dev/null \
+            | grep '^NEXTCLOUD_VERSION=' | cut -d= -f2- || true)
+        current_nc_ver=$(docker compose exec -T nextcloud php occ status --output=json 2>/dev/null \
+            | tr -d ' ' | grep -oE '"versionstring":"[^"]+"' | cut -d'"' -f4 || true)
+        if [[ -n "$backup_nc_ver" && "$backup_nc_ver" != "unknown" && -n "$current_nc_ver" ]]; then
+            if [[ "${backup_nc_ver%%.*}" != "${current_nc_ver%%.*}" ]]; then
+                warn "Версия в бэкапе (${backup_nc_ver}) и текущая (${current_nc_ver}) — разные мажоры."
+                warn "После восстановления Nextcloud может не запуститься."
+                read -rp "Всё равно продолжить? (введите 'yes'): " VER_CONFIRM
+                [[ "$VER_CONFIRM" == "yes" ]] || error "Восстановление отменено."
+            else
+                ok "Версия Nextcloud совместима (${backup_nc_ver})"
+            fi
+        fi
+    fi
+
+    # Нужно место под распаковку архива и под копию текущих данных.
+    local arch_kb free_kb
+    arch_kb=$(du -sk "$backup_file" | awk '{print $1}')
+    free_kb=$(df -Pk "$INSTALL_DIR" | awk 'NR==2 {print $4}')
+    if [[ $free_kb -lt $((arch_kb * 4)) ]]; then
+        warn "Мало свободного места: $((free_kb / 1024)) МБ при архиве $((arch_kb / 1024)) МБ."
+        read -rp "Продолжить? (введите 'yes'): " SPACE_CONFIRM
+        [[ "$SPACE_CONFIRM" == "yes" ]] || error "Восстановление отменено."
+    fi
+
+    warn "ВНИМАНИЕ: восстановление ПЕРЕЗАПИШЕТ текущие данные и базу FastCloud!"
+    info "Текущие данные будут сохранены рядом и удалены только после успеха."
+    read -rp "Продолжить восстановление из ${backup_file}? (введите 'yes'): " CONFIRM
+    [[ "$CONFIRM" != "yes" ]] && error "Восстановление отменено."
+
     local staging
-    staging=$(mktemp -d)
+    staging=$(mktemp -d -p "$INSTALL_DIR" .restore.XXXXXX)
     info "Распаковка архива..."
     tar -xzf "$backup_file" -C "$staging" || { rm -rf "$staging"; error "Не удалось распаковать архив."; }
 
     info "Остановка контейнеров..."
     docker compose down
 
+    # Старые данные и БД переносим, а не удаляем: при сбое на любом шаге ниже
+    # их возвращает rollback_restore, иначе потеря была бы безвозвратной.
+    local stamp prev_data prev_db
+    stamp=$(date +%Y%m%d_%H%M%S)
+    prev_data="${INSTALL_DIR}/data.before-restore-${stamp}"
+    prev_db="${INSTALL_DIR}/db.before-restore-${stamp}"
+
+    rollback_restore() {
+        warn "Откат: возвращаю прежнее состояние..."
+        rm -rf "${INSTALL_DIR}/data"
+        [[ -d "$prev_data" ]] && mv "$prev_data" "${INSTALL_DIR}/data"
+        if [[ -d "$prev_db" ]]; then
+            rm -rf "${INSTALL_DIR}/db"
+            mv "$prev_db" "${INSTALL_DIR}/db"
+        fi
+        for f in Caddyfile nextcloud.ini .env docker-compose.yml; do
+            [[ -f "${staging}/.prev_${f}" ]] && cp -a "${staging}/.prev_${f}" "${INSTALL_DIR}/${f}"
+        done
+        docker compose up -d > /dev/null 2>&1 || true
+        rm -rf "$staging"
+        error "Восстановление не удалось. Прежние данные возвращены на место."
+    }
+
+    info "Сохранение текущего состояния..."
+    for f in Caddyfile nextcloud.ini .env docker-compose.yml; do
+        [[ -f "${INSTALL_DIR}/${f}" ]] && cp -a "${INSTALL_DIR}/${f}" "${staging}/.prev_${f}"
+    done
+    mv "${INSTALL_DIR}/data" "$prev_data" || { rm -rf "$staging"; error "Не удалось сохранить текущие данные."; }
+    [[ -d "${INSTALL_DIR}/db" ]] && mv "${INSTALL_DIR}/db" "$prev_db"
+    mkdir -p "${INSTALL_DIR}/db"
+
     info "Восстановление файлов данных и конфигурации..."
-    rm -rf "${INSTALL_DIR}/data"
-    cp -a "${staging}/data" "${INSTALL_DIR}/data"
+    mv "${staging}/data" "${INSTALL_DIR}/data" || rollback_restore
     for f in Caddyfile nextcloud.ini .env docker-compose.yml; do
         [[ -f "${staging}/${f}" ]] && cp -a "${staging}/${f}" "${INSTALL_DIR}/${f}"
     done
 
     info "Запуск базы данных..."
-    docker compose up -d db
-    for _ in $(seq 1 30); do
-        docker compose exec -T db pg_isready -U nextcloud > /dev/null 2>&1 && break
+    docker compose up -d db || rollback_restore
+    local db_ready=0
+    for _ in $(seq 1 40); do
+        if docker compose exec -T db pg_isready -U nextcloud > /dev/null 2>&1; then db_ready=1; break; fi
         sleep 2
     done
+    [[ $db_ready -eq 1 ]] || rollback_restore
 
     info "Восстановление базы данных из дампа..."
     docker compose exec -T db psql -U nextcloud -d nextcloud \
         -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" > /dev/null 2>&1 || true
-    if ! gunzip -c "${staging}/database.sql.gz" | docker compose exec -T db psql -U nextcloud -d nextcloud > /dev/null 2>&1; then
-        rm -rf "$staging"
-        error "Не удалось восстановить базу данных."
+    # ON_ERROR_STOP: без него psql проглотит ошибки и оставит битую БД,
+    # отрапортовав об успехе.
+    if ! gunzip -c "${staging}/database.sql.gz" \
+        | docker compose exec -T db psql -U nextcloud -d nextcloud -v ON_ERROR_STOP=1 > /dev/null 2>&1; then
+        rollback_restore
     fi
 
     info "Запуск остальных сервисов..."
-    docker compose up -d
+    docker compose up -d || rollback_restore
+
+    info "Проверка работоспособности Nextcloud..."
+    local nc_ok=0
+    for _ in $(seq 1 60); do
+        if docker compose exec -T nextcloud curl -fsS http://localhost/status.php 2>/dev/null \
+            | grep -q '"installed":true'; then nc_ok=1; break; fi
+        sleep 2
+    done
+    if [[ $nc_ok -ne 1 ]]; then
+        warn "Nextcloud не ответил после восстановления."
+        read -rp "Откатиться к прежнему состоянию? [Y/n]: " DO_ROLLBACK
+        [[ "$DO_ROLLBACK" =~ ^[Nn]$ ]] || rollback_restore
+    else
+        ok "Nextcloud отвечает"
+    fi
 
     rm -rf "$staging"
-    ok "Восстановление завершено. Проверьте статус: ./manage.sh status"
+    ok "Восстановление завершено."
+    echo ""
+    info "Прежнее состояние сохранено в:"
+    echo "  ${prev_data}"
+    [[ -d "$prev_db" ]] && echo "  ${prev_db}"
+    echo ""
+    warn "Убедитесь, что всё работает, затем удалите их для освобождения места:"
+    echo -e "  ${CYAN}rm -rf ${prev_data} ${prev_db}${NC}"
 }
 
 cmd_update() {
     info "Обновление FastCloud..."
     cd "$INSTALL_DIR"
 
-    docker compose exec -T nextcloud php occ maintenance:mode --on > /dev/null 2>&1 || true
-
     info "Создание бэкапа перед обновлением..."
     cmd_backup
 
+    # Запоминаем текущие digest'ы: теги плавающие, и при неудачном обновлении
+    # без них вернуться к работавшим образам невозможно.
+    local prev_digests
+    prev_digests=$(docker compose config --images 2>/dev/null | while read -r img; do
+        [[ -n "$img" ]] || continue
+        docker image inspect "$img" --format '{{.RepoTags}} {{.Id}}' 2>/dev/null || true
+    done)
+    [[ -n "$prev_digests" ]] && printf '%s\n' "$prev_digests" > "${INSTALL_DIR}/.previous_images"
+
+    docker compose exec -T nextcloud php occ maintenance:mode --on > /dev/null 2>&1 || true
+
     info "Скачивание новых образов..."
-    docker compose pull
+    if ! docker compose pull; then
+        docker compose exec -T nextcloud php occ maintenance:mode --off > /dev/null 2>&1 || true
+        error "Не удалось скачать образы. Обновление отменено, стек не тронут."
+    fi
 
     info "Перезапуск контейнеров..."
     docker compose up -d
 
     info "Ожидание инициализации Nextcloud..."
+    # Готовность проверяем по status.php: occ на слабом сервере поднимает
+    # тяжёлый PHP-процесс и может не ответить, хотя стек живой.
     local ready=false
-    for _ in $(seq 1 60); do
-        if docker compose exec -T nextcloud php occ status &>/dev/null; then
+    for _ in $(seq 1 90); do
+        if docker compose exec -T nextcloud curl -fsS http://localhost/status.php 2>/dev/null \
+            | grep -q '"installed":true'; then
             ready=true
             break
         fi
         sleep 2
     done
-    [[ "$ready" == true ]] || warn "Nextcloud не ответил за отведённое время, продолжаю с осторожностью."
+
+    if [[ "$ready" != true ]]; then
+        echo ""
+        warn "Nextcloud не поднялся после обновления."
+        docker compose logs --tail 30 nextcloud 2>/dev/null | grep -iv '"GET \|"HEAD \|"POST ' || true
+        echo ""
+        warn "Доступен бэкап, созданный перед обновлением, в ${BACKUP_DIR}."
+        echo -e "  Откат: ${CYAN}./manage.sh restore <файл-бэкапа>${NC}"
+        docker compose exec -T nextcloud php occ maintenance:mode --off > /dev/null 2>&1 || true
+        error "Обновление завершилось неудачно."
+    fi
+    ok "Nextcloud отвечает после обновления"
 
     docker compose exec -T nextcloud php occ maintenance:mode --off > /dev/null 2>&1 || true
 
@@ -745,6 +1028,202 @@ cmd_update() {
     docker image prune -f > /dev/null 2>&1 || true
 
     ok "FastCloud обновлен"
+}
+
+cmd_doctor() {
+    local problems=0 warnings=0
+    echo -e "${CYAN}=== FastCloud Doctor ===${NC}"
+    echo ""
+    cd "$INSTALL_DIR"
+
+    echo -e "${CYAN}Контейнеры:${NC}"
+    local expected="db redis nextcloud caddy"
+    for svc in $expected; do
+        local state
+        state=$(docker compose ps --format '{{.Service}} {{.State}}' 2>/dev/null \
+            | awk -v s="$svc" '$1==s {print $2}')
+        if [[ "$state" == "running" ]]; then
+            echo -e "  ${GREEN}✓${NC} ${svc}: running"
+        else
+            echo -e "  ${RED}✗${NC} ${svc}: ${state:-отсутствует}"
+            problems=$((problems + 1))
+        fi
+    done
+    echo ""
+
+    echo -e "${CYAN}Доступность Nextcloud:${NC}"
+    if docker compose exec -T nextcloud curl -fsS http://localhost/status.php 2>/dev/null \
+        | grep -q '"installed":true'; then
+        echo -e "  ${GREEN}✓${NC} status.php отвечает, установка завершена"
+    else
+        echo -e "  ${RED}✗${NC} status.php не отвечает"
+        problems=$((problems + 1))
+    fi
+    echo ""
+
+    echo -e "${CYAN}Диск:${NC}"
+    local use_pct free_h
+    use_pct=$(df --output=pcent "$INSTALL_DIR" 2>/dev/null | tail -n1 | tr -dc '0-9')
+    free_h=$(df -h "$INSTALL_DIR" | awk 'NR==2 {print $4}')
+    if [[ -n "$use_pct" && $use_pct -ge 90 ]]; then
+        echo -e "  ${RED}✗${NC} занято ${use_pct}%, свободно ${free_h}"
+        problems=$((problems + 1))
+    elif [[ -n "$use_pct" && $use_pct -ge 80 ]]; then
+        echo -e "  ${YELLOW}!${NC} занято ${use_pct}%, свободно ${free_h}"
+        warnings=$((warnings + 1))
+    else
+        echo -e "  ${GREEN}✓${NC} занято ${use_pct:-?}%, свободно ${free_h}"
+    fi
+    du -sh "${INSTALL_DIR}/data" 2>/dev/null | awk '{print "    данные: " $1}'
+    du -sh "${INSTALL_DIR}/db" 2>/dev/null | awk '{print "    база:   " $1}'
+    echo ""
+
+    echo -e "${CYAN}Память:${NC}"
+    local mem_free_mb swap_used_mb
+    mem_free_mb=$(free -m | awk '/^Mem:/ {print $7}')
+    swap_used_mb=$(free -m | awk '/^Swap:/ {print $3}')
+    if [[ -n "$mem_free_mb" && $mem_free_mb -lt 150 ]]; then
+        echo -e "  ${YELLOW}!${NC} доступно ${mem_free_mb} МБ — риск OOM"
+        warnings=$((warnings + 1))
+    else
+        echo -e "  ${GREEN}✓${NC} доступно ${mem_free_mb:-?} МБ"
+    fi
+    [[ -n "$swap_used_mb" ]] && echo "    swap занят: ${swap_used_mb} МБ"
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q .; then
+        docker stats --no-stream --format '    {{.Name}}: {{.MemUsage}}' 2>/dev/null | head -6 || true
+    fi
+    echo ""
+
+    echo -e "${CYAN}SSL-сертификат:${NC}"
+    local mode; mode=$(cat "${INSTALL_DIR}/.install_mode" 2>/dev/null || echo "")
+    if [[ "$mode" == "public-domain" ]]; then
+        local dom; dom=$(grep '^DOMAIN=' "${INSTALL_DIR}/.env" 2>/dev/null | cut -d= -f2-)
+        local not_after days_left
+        not_after=$(echo | openssl s_client -servername "$dom" -connect "${dom}:443" 2>/dev/null \
+            | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2 || true)
+        if [[ -n "$not_after" ]]; then
+            days_left=$(( ( $(date -d "$not_after" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))
+            if [[ $days_left -lt 7 ]]; then
+                echo -e "  ${RED}✗${NC} истекает через ${days_left} дн. (${not_after})"
+                problems=$((problems + 1))
+            elif [[ $days_left -lt 21 ]]; then
+                echo -e "  ${YELLOW}!${NC} истекает через ${days_left} дн."
+                warnings=$((warnings + 1))
+            else
+                echo -e "  ${GREEN}✓${NC} действителен ещё ${days_left} дн."
+            fi
+        else
+            echo -e "  ${YELLOW}!${NC} не удалось проверить сертификат для ${dom}"
+            warnings=$((warnings + 1))
+        fi
+    else
+        echo "  — режим ${mode:-неизвестен}, HTTPS не используется"
+    fi
+    echo ""
+
+    echo -e "${CYAN}Бэкапы:${NC}"
+    local latest
+    latest=$(ls -t "${BACKUP_DIR}"/fastcloud_backup_*.tar.gz 2>/dev/null | head -n1 || true)
+    if [[ -n "$latest" ]]; then
+        local age_days
+        age_days=$(( ( $(date +%s) - $(stat -c %Y "$latest") ) / 86400 ))
+        local count; count=$(ls "${BACKUP_DIR}"/fastcloud_backup_*.tar.gz 2>/dev/null | wc -l)
+        if [[ $age_days -gt 7 ]]; then
+            echo -e "  ${RED}✗${NC} последний бэкап ${age_days} дн. назад ($(basename "$latest"))"
+            problems=$((problems + 1))
+        elif [[ $age_days -gt 2 ]]; then
+            echo -e "  ${YELLOW}!${NC} последний бэкап ${age_days} дн. назад"
+            warnings=$((warnings + 1))
+        else
+            echo -e "  ${GREEN}✓${NC} последний бэкап ${age_days} дн. назад"
+        fi
+        echo "    всего архивов: ${count}, каталог: ${BACKUP_DIR}"
+        echo -e "    проверить пригодность: ${CYAN}./manage.sh verify-backup${NC}"
+    else
+        echo -e "  ${RED}✗${NC} бэкапов нет — настройте: ./manage.sh backup"
+        problems=$((problems + 1))
+    fi
+    if [[ -f "$BACKUP_REMOTE_FILE" ]]; then
+        echo -e "  ${GREEN}✓${NC} оффсайт-бэкапы настроены"
+    else
+        echo -e "  ${YELLOW}!${NC} оффсайт-бэкапы не настроены (backup-setup)"
+        warnings=$((warnings + 1))
+    fi
+    echo ""
+
+    echo -e "${CYAN}Фоновые задачи Nextcloud:${NC}"
+    if [[ -f /etc/cron.d/fastcloud-nextcloud ]]; then
+        echo -e "  ${GREEN}✓${NC} системный cron установлен"
+        local last_cron
+        last_cron=$(docker compose exec -T -u www-data nextcloud php occ config:app:get \
+            core lastcron 2>/dev/null | tr -dc '0-9' || true)
+        if [[ -n "$last_cron" && "$last_cron" -gt 0 ]]; then
+            local cron_age=$(( ( $(date +%s) - last_cron ) / 60 ))
+            if [[ $cron_age -gt 30 ]]; then
+                echo -e "  ${YELLOW}!${NC} последний запуск ${cron_age} мин назад (ожидается ≤10)"
+                warnings=$((warnings + 1))
+            else
+                echo -e "  ${GREEN}✓${NC} последний запуск ${cron_age} мин назад"
+            fi
+        fi
+    else
+        echo -e "  ${RED}✗${NC} /etc/cron.d/fastcloud-nextcloud отсутствует"
+        problems=$((problems + 1))
+    fi
+    echo ""
+
+    echo -e "${CYAN}Защита и доступ:${NC}"
+    # За reverse-proxy Nextcloud без trusted_proxies видит IP Caddy вместо
+    # клиентского: встроенная защита от брутфорса при этом не работает.
+    local tp
+    tp=$(docker compose exec -T -u www-data nextcloud php occ config:system:get \
+        trusted_proxies 2>/dev/null | tr -d '[:space:]' || true)
+    if [[ -n "$tp" ]]; then
+        echo -e "  ${GREEN}✓${NC} trusted_proxies настроен (${tp})"
+    else
+        echo -e "  ${RED}✗${NC} trusted_proxies не задан — защита от брутфорса видит только IP Caddy"
+        problems=$((problems + 1))
+    fi
+    if command -v fail2ban-client &>/dev/null; then
+        if fail2ban-client status fastcloud-nextcloud &>/dev/null; then
+            local banned
+            banned=$(fail2ban-client status fastcloud-nextcloud 2>/dev/null \
+                | grep -i 'Currently banned' | tr -dc '0-9' || echo 0)
+            echo -e "  ${GREEN}✓${NC} fail2ban активен (забанено сейчас: ${banned:-0})"
+        else
+            echo -e "  ${YELLOW}!${NC} jail fastcloud-nextcloud неактивен"
+            warnings=$((warnings + 1))
+        fi
+    fi
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        echo -e "  ${GREEN}✓${NC} UFW активен"
+    else
+        echo -e "  ${YELLOW}!${NC} UFW неактивен"
+        warnings=$((warnings + 1))
+    fi
+    echo ""
+
+    echo -e "${CYAN}Права на секреты:${NC}"
+    for f in .env .admin_password .telegram_config .rclone.conf; do
+        [[ -f "${INSTALL_DIR}/${f}" ]] || continue
+        local perms; perms=$(stat -c %a "${INSTALL_DIR}/${f}")
+        if [[ "$perms" == "600" ]]; then
+            echo -e "  ${GREEN}✓${NC} ${f}: ${perms}"
+        else
+            echo -e "  ${YELLOW}!${NC} ${f}: ${perms} (ожидается 600)"
+            warnings=$((warnings + 1))
+        fi
+    done
+    echo ""
+
+    echo -e "${CYAN}=== Итог ===${NC}"
+    if [[ $problems -eq 0 && $warnings -eq 0 ]]; then
+        ok "Проблем не обнаружено."
+    else
+        [[ $problems -gt 0 ]] && echo -e "  ${RED}Проблем: ${problems}${NC}"
+        [[ $warnings -gt 0 ]] && echo -e "  ${YELLOW}Предупреждений: ${warnings}${NC}"
+    fi
+    [[ $problems -eq 0 ]]
 }
 
 cmd_show_password() {
@@ -774,7 +1253,7 @@ cmd_reset_password() {
         echo ""
     fi
     if [[ -z "$new_password" ]]; then
-        new_password=$(openssl rand -base64 48 | tr -d '/+=' | head -c 24)
+        new_password=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)
         info "Сгенерирован новый пароль."
     fi
 
@@ -1009,11 +1488,13 @@ show_help() {
     echo ""
     echo -e "${YELLOW}Команды:${NC}"
     echo -e "  ${GREEN}status${NC}              - Показать статус FastCloud"
+    echo -e "  ${GREEN}doctor${NC}              - Самодиагностика (контейнеры, диск, SSL, бэкапы, защита)"
     echo -e "  ${GREEN}logs [сервис]${NC}       - Показать логи (опционально конкретного сервиса)"
     echo -e "  ${GREEN}restart${NC}             - Перезапустить FastCloud"
     echo -e "  ${GREEN}stop${NC}                - Остановить FastCloud"
     echo -e "  ${GREEN}start${NC}               - Запустить FastCloud"
     echo -e "  ${GREEN}backup${NC}              - Создать локальный бэкап (данные + дамп БД)"
+    echo -e "  ${GREEN}verify-backup [файл]${NC} - Проверить, что бэкап реально восстановим"
     echo -e "  ${GREEN}restore <файл>${NC}      - Восстановить из бэкапа"
     echo -e "  ${GREEN}update${NC}              - Обновить FastCloud"
     echo -e "  ${GREEN}occ <аргументы>${NC}     - Выполнить команду Nextcloud occ"
@@ -1043,6 +1524,10 @@ interactive_menu() {
         echo -e "   ${GREEN}6)${NC} Создать бэкап"
         echo -e "   ${GREEN}7)${NC} Восстановить из бэкапа"
         echo -e "   ${GREEN}8)${NC} Обновить FastCloud"
+        echo ""
+        echo -e "${YELLOW}Диагностика:${NC}"
+        echo -e "  ${GREEN}19)${NC} Самодиагностика (doctor)"
+        echo -e "  ${GREEN}20)${NC} Проверить бэкап на восстановимость"
         echo ""
         echo -e "${YELLOW}Администрирование:${NC}"
         echo -e "   ${GREEN}9)${NC} Показать пароль администратора"
@@ -1085,6 +1570,8 @@ interactive_menu() {
             16) ( cmd_backup_setup ) ;;
             17) ( cmd_backup_remote ) ;;
             18) ( cmd_uninstall ) ;;
+            19) ( cmd_doctor ) || true ;;
+            20) read -rp "Путь к бэкапу (пусто = последний): " vbf; ( cmd_verify_backup "$vbf" ) ;;
             0)  echo -e "${CYAN}До встречи!${NC}"; break ;;
             *)  warn "Неверный пункт меню" ;;
         esac
@@ -1105,11 +1592,13 @@ main() {
 
     case "$command" in
         status)          cmd_status ;;
+        doctor)          cmd_doctor ;;
         logs)            cmd_logs "$@" ;;
         restart)         cmd_restart ;;
         stop)            cmd_stop ;;
         start)           cmd_start ;;
         backup)          cmd_backup ;;
+        verify-backup)   cmd_verify_backup "$@" ;;
         restore)         cmd_restore "$@" ;;
         update)          cmd_update ;;
         occ)             cmd_occ "$@" ;;
@@ -1219,6 +1708,34 @@ if [[ -n "$USE_PCT" ]]; then
     FREE_PCT=$((100 - USE_PCT))
     if [[ $FREE_PCT -lt $DISK_THRESHOLD ]]; then
         ALERTS+="🔴 Мало места на диске: свободно ${FREE_PCT}% (порог ${DISK_THRESHOLD}%)"$'\n'
+    fi
+fi
+
+# Истёкший сертификат — самая частая причина недоступности самохоста, причём
+# Caddy может молча не продлить его (занят порт 80, rate-limit LE).
+if [[ "$(cat "${INSTALL_DIR}/.install_mode" 2>/dev/null)" == "public-domain" ]]; then
+    DOM=$(grep '^DOMAIN=' "${INSTALL_DIR}/.env" 2>/dev/null | cut -d= -f2-)
+    if [[ -n "$DOM" ]]; then
+        NOT_AFTER=$(echo | timeout 10 openssl s_client -servername "$DOM" -connect "${DOM}:443" 2>/dev/null \
+            | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2 || true)
+        if [[ -n "$NOT_AFTER" ]]; then
+            DAYS_LEFT=$(( ( $(date -d "$NOT_AFTER" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))
+            if [[ $DAYS_LEFT -lt 14 ]]; then
+                ALERTS+="🔐 SSL-сертификат ${DOM} истекает через ${DAYS_LEFT} дн."$'\n'
+            fi
+        else
+            ALERTS+="🔐 Не удалось проверить SSL-сертификат ${DOM} (порт 443 недоступен?)"$'\n'
+        fi
+    fi
+fi
+
+# Бэкапы: молча переставший работать cron обнаруживается только по возрасту
+# последнего архива.
+LATEST_BACKUP=$(ls -t /opt/fastcloud-backups/fastcloud_backup_*.tar.gz 2>/dev/null | head -n1 || true)
+if [[ -n "$LATEST_BACKUP" ]]; then
+    BACKUP_AGE_DAYS=$(( ( $(date +%s) - $(stat -c %Y "$LATEST_BACKUP") ) / 86400 ))
+    if [[ $BACKUP_AGE_DAYS -gt 8 ]]; then
+        ALERTS+="💾 Последний бэкап создан ${BACKUP_AGE_DAYS} дн. назад"$'\n'
     fi
 fi
 

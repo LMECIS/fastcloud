@@ -1,4 +1,4 @@
-name: shellcheck
+name: lint
 
 on:
   push:
@@ -16,3 +16,62 @@ jobs:
 
       - name: Lint install.sh
         run: shellcheck --severity=warning install.sh
+
+      # manage.sh, monitor.sh и telegram-report.sh генерируются из heredoc'ов
+      # внутри install.sh, поэтому линтер их не видит — извлекаем и проверяем.
+      - name: Lint generated scripts
+        run: |
+          mkdir -p /tmp/gen
+          awk '/^cat > manage.sh <<.MANAGE_EOF.$/{f=1;next} /^MANAGE_EOF$/{f=0} f' \
+            install.sh > /tmp/gen/manage.sh
+          awk '/^cat > scripts\/monitor.sh <<.MONITOR_EOF.$/{f=1;next} /^MONITOR_EOF$/{f=0} f' \
+            install.sh > /tmp/gen/monitor.sh
+          awk '/^cat > scripts\/telegram-report.sh <<.TELEGRAM_EOF.$/{f=1;next} /^TELEGRAM_EOF$/{f=0} f' \
+            install.sh > /tmp/gen/telegram-report.sh
+          for f in manage.sh monitor.sh telegram-report.sh; do
+            test -s "/tmp/gen/$f" || { echo "::error::не удалось извлечь $f"; exit 1; }
+            bash -n "/tmp/gen/$f" || exit 1
+            echo "$f: синтаксис в порядке"
+          done
+          # SC1090 — динамический source конфигов, ожидаемо и безопасно.
+          shellcheck --severity=warning --exclude=SC1090 /tmp/gen/*.sh
+
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # docker-compose.yml тоже генерируется установщиком: проверяем, что он
+      # валиден и что лимиты/пароли подставляются, а не теряются.
+      - name: Validate generated docker-compose.yml
+        run: |
+          mkdir -p /tmp/compose && cd /tmp/compose
+          awk '/^cat > docker-compose.yml <<.EOF.$/{f=1;next} f&&/^EOF$/{exit} f' \
+            "$GITHUB_WORKSPACE/install.sh" > docker-compose.yml
+          test -s docker-compose.yml || { echo "::error::compose не извлечён"; exit 1; }
+          cat > .env <<'ENVEOF'
+          DOMAIN=cloud.example.com
+          DB_PASSWORD=ci_db_pw
+          REDIS_PASSWORD=ci_redis_pw
+          ADMIN_PASSWORD=ci_admin_pw
+          OVERWRITE_PROTOCOL=https
+          OVERWRITE_HOST=cloud.example.com
+          NC_URL=https://cloud.example.com
+          INSTALL_DIR=/opt/fastcloud
+          DB_MEM_LIMIT=512m
+          REDIS_MEM_LIMIT=192m
+          REDIS_MAXMEMORY=128mb
+          NC_MEM_LIMIT=1g
+          PHP_MEM=512M
+          ENVEOF
+          docker compose config > resolved.yml
+          echo "compose валиден"
+          for svc in db redis nextcloud; do
+            grep -q "mem_limit" resolved.yml \
+              || { echo "::error::mem_limit потерян"; exit 1; }
+          done
+          grep -q "maxmemory" resolved.yml \
+            || { echo "::error::redis maxmemory не подставлен"; exit 1; }
+          grep -q "ci_redis_pw" resolved.yml \
+            || { echo "::error::пароли не подставляются"; exit 1; }
+          echo "лимиты и подстановка переменных на месте"
